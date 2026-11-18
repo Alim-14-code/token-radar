@@ -124,6 +124,10 @@ tbody tr[data-selected="true"] { background: rgba(61, 220, 132, 0.08); }
 
 .model { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
 .model p { color: var(--muted); max-width: 78ch; }
+.calib { font-size: 13px; }
+.calib caption { text-align: left; padding: var(--step-2) 0; max-width: 78ch; }
+.calib td:first-child { font-weight: 600; }
+.calib tbody tr:last-child td { font-weight: 600; color: var(--accent); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--ink); overflow-wrap: anywhere; background: var(--canvas); border: 1px solid var(--border); border-radius: var(--radius-control); padding: var(--step-3); }
 .sandbox { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--step-3) var(--step-6); margin-top: var(--step-2); }
 .slider { display: grid; grid-template-columns: 150px 1fr 64px; align-items: center; gap: var(--step-3); font-size: 13px; }
