@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/token-radar-01/Alim-14-code/token-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/Alim-14-code/token-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-Token Radar ranks every pre-token protocol in a sealed DefiLlama snapshot by the implied value of its launch, each with a concrete farm plan, in a static dashboard that runs with no network. Model radar-3 calibrates each category's multiple from the snapshot's own live-token protocols (median market-cap-to-TVL, at least 4 live protocols, clamped 0.05..0.60), weights TVL falls half again as much as rises, and lets maturity decay gently after three years without a token.
+Token Radar ranks every pre-token protocol in a sealed DefiLlama snapshot by the implied value of its launch, each with a concrete farm plan, in a static dashboard that runs with no network. Model radar-4 fits the launch multiple to the snapshot itself: log market cap against log TVL over the snapshot's own live-token protocols (slope 0.52 — market cap grows with roughly the square root of TVL), so each protocol reads its multiple off that size curve at its own TVL, clamped 0.02..1.00. The fit is walk-forward validated against a flat median (out-of-sample log error 2.25 vs 2.60 on 2025 listings). The model weights TVL falls half again as much as rises, and lets maturity decay gently after three years without a token.
 
 ## Run it
 
