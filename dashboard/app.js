@@ -11,9 +11,10 @@
   var WATCH = {};
   (DATA.watchlist || []).forEach(function (s) { WATCH[s] = true; });
   var BASE_MODEL = DATA.model;
+  var BASE_FIT = DATA.fit || { intercept: 6.96, slope: 0.52, r2: 0.19, liveCount: 0, multipleFloor: 0.02, multipleCap: 1.0, quartiles: [], walkForward: [] };
   var state = {
     q: '', category: 'all', chain: 'all', tab: 'pre-token', growth: 'all',
-    sort: 'implied', dir: -1, selected: null, model: null
+    sort: 'implied', dir: -1, selected: null, model: null, fit: null
   };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
@@ -37,11 +38,15 @@
 
   // The eight chains with the most aggregate TVL in the snapshot: they count in full.
   var MAJOR_CHAINS = { 'Ethereum': 1, 'Avalanche': 1, 'Arbitrum': 1, 'Polygon': 1, 'Solana': 1, 'Base': 1, 'Bitcoin': 1, 'Optimism': 1 };
-  var CALIBRATION = DATA.calibration || { fallback: 0.214, byCategory: {}, counts: {}, medians: {}, liveCount: 0 };
-  function categoryMultiple(row) {
-    var cat = row.category || 'Other';
-    return CALIBRATION.byCategory[cat] !== undefined ? CALIBRATION.byCategory[cat] : CALIBRATION.fallback;
+  var FIT = BASE_FIT;
+  // The multiple a TVL reads off the fitted size curve: log(mcap) = a + b*log(tvl) over the
+  // snapshot's own live-token protocols, clamped. The market pays less per dollar of TVL as a
+  // protocol gets bigger, so a flat median overvalues the giants and undervalues the small.
+  function sizeMultiple(tvl, fit) {
+    var raw = Math.exp(fit.intercept) * Math.pow(tvl, fit.slope - 1);
+    return Math.min(fit.multipleCap, Math.max(fit.multipleFloor, raw));
   }
+  function activeFit() { return state.fit || FIT; }
   function effectiveChains(row) {
     return (row.chains || []).reduce(function (n, c) { return n + (MAJOR_CHAINS[c] ? 1 : 0.5); }, 0);
   }
@@ -56,22 +61,26 @@
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same
   // arithmetic. The sandbox calls it with changed constants; the board keeps the submitted ones.
-  // The multiple is calibrated, not guessed: each category's median market-cap-to-TVL ratio
-  // among the snapshot's own live-token protocols (at least 4 of them), clamped to 0.05..0.60,
-  // and the global median where a category has too few live protocols to calibrate.
-  function impliedOf(row, model) {
+  // The multiple is fitted, not guessed: log(mcap) = a + b*log(tvl) by least squares over the
+  // snapshot's own live-token protocols (b = 0.52 here: market cap grows with roughly the square
+  // root of TVL), read off the curve at the protocol's TVL and clamped to 0.02..1.00. A flat
+  // median would charge the same multiple at every size; the snapshot's own quartiles say the
+  // median ratio falls from 0.88 at the smallest TVLs to 0.05 at the largest.
+  function impliedOf(row, model, fit) {
+    fit = fit || activeFit();
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var weight = growth >= 0 ? model.growth_up_weight : model.growth_down_weight;
     var growthMult = 1 + (growth / 100) * weight;
     var maturity = maturityOf(row, model);
     var chainMult = 1 + model.chain_bonus * Math.min(effectiveChains(row), model.chain_cap);
-    return Math.max(1, Math.round(row.tvl_usd * categoryMultiple(row) * growthMult * maturity * chainMult));
+    return Math.max(1, Math.round(row.tvl_usd * sizeMultiple(row.tvl_usd, fit) * growthMult * maturity * chainMult));
   }
-  function multipliersOf(row, model) {
+  function multipliersOf(row, model, fit) {
+    fit = fit || activeFit();
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var weight = growth >= 0 ? model.growth_up_weight : model.growth_down_weight;
     return {
-      multiple: categoryMultiple(row),
+      multiple: sizeMultiple(row.tvl_usd, fit),
       growth: 1 + (growth / 100) * weight,
       maturity: maturityOf(row, model),
       chain: 1 + model.chain_bonus * Math.min(effectiveChains(row), model.chain_cap)
@@ -136,6 +145,17 @@
     if (c.indexOf('stable') >= 0) return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + '.';
     if (c.indexOf('rwa') >= 0) return "Mint $" + capital + " of the protocol's yield asset on " + chain + ' and hold it.';
     if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy active.';
+    if (c.indexOf('basis') >= 0) return 'Deposit $' + capital + ' of USDC as margin on ' + name + ' and open a basis position against a spot holding of the same size.';
+    if (c === 'chain') return 'Bridge $' + capital + ' of USDC onto ' + chain + " through " + name + "'s native app and keep the funds working there.";
+    if (c.indexOf('payment') >= 0) return 'Pay $' + capital + ' through ' + name + ' on ' + chain + ' and keep the receipt for the payment.';
+    if (c.indexOf('cedefi') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' CeDeFi vault on ' + chain + ' and keep the shares.';
+    if (c.indexOf('otc') >= 0) return 'Place a $' + capital + ' OTC quote on ' + name + ' on ' + chain + ' and settle one trade through it.';
+    if (c.indexOf('liquidity manager') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' managed pool on ' + chain + ' and keep the position open.';
+    if (c.indexOf('index') >= 0) return 'Buy $' + capital + ' of the ' + name + ' index token on ' + chain + ' and hold it.';
+    if (c.indexOf('governance') >= 0) return 'Lock $' + capital + ' of assets to vote through ' + name + ' on ' + chain + ' and cast one vote.';
+    if (c === 'farm') return 'Deposit $' + capital + ' of USDC into ' + name + "'s farm on " + chain + ' and keep the position open.';
+    if (c.indexOf('btc') >= 0) return 'Deposit $' + capital + ' of BTC-backed assets through ' + name + ' on ' + chain + ' and keep the receipt token.';
+    if (c.indexOf('card') >= 0) return 'Top up $' + capital + ' on the ' + name + ' card from ' + chain + ' and spend a small amount through it.';
     return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
   }
   function secondActionFor(p, capital, chain) {
@@ -152,6 +172,17 @@
     if (c.indexOf('stable') >= 0) return 'Mint a second $' + small + ' tranche of the stable asset through ' + name + ' on ' + chain + '.';
     if (c.indexOf('rwa') >= 0) return 'Buy $' + small + ' more of the yield asset on ' + name + ' and add it to the same wallet.';
     if (c.indexOf('insurance') >= 0) return 'Top up the cover by $' + small + ' on ' + name + ' so the policy shows a second purchase.';
+    if (c.indexOf('basis') >= 0) return 'Close and reopen a $' + small + ' basis leg on ' + name + ', so the wallet has two basis trades on record.';
+    if (c === 'chain') return 'Send $' + small + ' back off ' + chain + " through " + name + "'s native app, so the wallet has used the chain twice.";
+    if (c.indexOf('payment') >= 0) return 'Make a second $' + small + ' payment through ' + name + ' on ' + chain + ' from the same wallet.';
+    if (c.indexOf('cedefi') >= 0) return 'Move $' + small + ' between two ' + name + ' vaults on ' + chain + ' and keep the new shares.';
+    if (c.indexOf('otc') >= 0) return 'Settle a second $' + small + ' OTC trade through ' + name + ' on ' + chain + '.';
+    if (c.indexOf('liquidity manager') >= 0) return 'Rebalance $' + small + ' inside the ' + name + ' managed pool on ' + chain + '.';
+    if (c.indexOf('index') >= 0) return 'Buy $' + small + ' more of the ' + name + ' index token on ' + chain + ' and add it to the same wallet.';
+    if (c.indexOf('governance') >= 0) return 'Cast a second vote with $' + small + ' locked through ' + name + ' on ' + chain + '.';
+    if (c === 'farm') return 'Harvest once from ' + name + "'s farm on " + chain + ' and redeposit the $' + small + ' of rewards.';
+    if (c.indexOf('btc') >= 0) return 'Move $' + small + ' of BTC-backed assets through ' + name + ' a second time and keep the new receipt.';
+    if (c.indexOf('card') >= 0) return 'Spend another $' + small + ' through the ' + name + ' card so it shows a second purchase.';
     return 'Make a second deposit of $' + small + ' into ' + name + ' on ' + chain + ' from the same wallet.';
   }
   function stepText(step) {
@@ -173,6 +204,17 @@
     if (c.indexOf('stable') >= 0) return 'Mint $' + small + ' more of the stable asset through ' + name + ' on ' + chain + ' each week.';
     if (c.indexOf('rwa') >= 0) return 'Buy $' + small + ' more of the yield asset on ' + name + ' each week and add it to the same wallet.';
     if (c.indexOf('insurance') >= 0) return 'Top up the cover by $' + small + ' on ' + name + ' each week so the policy keeps growing.';
+    if (c.indexOf('basis') >= 0) return 'Roll the basis position on ' + name + ' once a week, so the wallet keeps the basis trade live.';
+    if (c === 'chain') return 'Use ' + name + "'s native app on " + chain + ' once a week, so the wallet stays active on the chain.';
+    if (c.indexOf('payment') >= 0) return 'Make one $' + small + ' payment through ' + name + ' each week, so the wallet keeps paying.';
+    if (c.indexOf('cedefi') >= 0) return 'Move $' + small + ' between ' + name + ' vaults on ' + chain + ' each week and keep the new shares.';
+    if (c.indexOf('otc') >= 0) return 'Settle one $' + small + ' OTC trade through ' + name + ' each week.';
+    if (c.indexOf('liquidity manager') >= 0) return 'Rebalance $' + small + ' inside the ' + name + ' managed pool each week.';
+    if (c.indexOf('index') >= 0) return 'Buy $' + small + ' more of the ' + name + ' index token each week and add it to the same wallet.';
+    if (c.indexOf('governance') >= 0) return 'Vote once a week through ' + name + ' with $' + small + ' locked, so the wallet keeps voting.';
+    if (c === 'farm') return 'Harvest and redeposit $' + small + ' from ' + name + "'s farm each week.";
+    if (c.indexOf('btc') >= 0) return 'Move $' + small + ' of BTC-backed assets through ' + name + ' each week and keep every receipt.';
+    if (c.indexOf('card') >= 0) return 'Spend $' + small + ' through the ' + name + ' card each week so the card stays active.';
     return 'Make one qualifying action on ' + name + ' each week, such as a deposit, a borrow, a swap or a vote.';
   }
   function farmSteps(p) {
@@ -445,34 +487,84 @@
     );
   }
 
-  function calibrationTable() {
-    var rows = Object.keys(CALIBRATION.byCategory).sort().map(function (cat) {
-      var n = CALIBRATION.counts[cat] || 0;
-      var med = CALIBRATION.medians[cat];
-      var mult = CALIBRATION.byCategory[cat];
+  // The size curve as a picture: every live-token protocol as a dot (log TVL vs log market
+  // cap) and the fitted line through them. A flat multiple would be a 45-degree line; the
+  // fitted slope is well under 1, so the line bends away from it at the big end.
+  function fitChart() {
+    var live = (DATA.live || []).filter(function (r) { return r.mcap_usd && r.tvl_usd; });
+    if (live.length < 10) return el('p', { class: 'sub', text: 'Too few live-token protocols to draw the fit.' });
+    var W = 640, H = 300, PL = 46, PR = 12, PT = 14, PB = 34;
+    var xs = live.map(function (r) { return Math.log10(r.tvl_usd); });
+    var ys = live.map(function (r) { return Math.log10(r.mcap_usd); });
+    var x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+    var y0 = Math.min.apply(null, ys), y1 = Math.max.apply(null, ys);
+    var pad = 0.3;
+    x0 -= pad; x1 += pad; y0 -= pad; y1 += pad;
+    function X(v) { return PL + ((v - x0) / (x1 - x0)) * (W - PL - PR); }
+    function Y(v) { return PT + (1 - (v - y0) / (y1 - y0)) * (H - PT - PB); }
+    var LN10 = Math.LN10;
+    function lineY(logTvl) { return (FIT.intercept + FIT.slope * logTvl) / LN10; }
+    var dots = live.map(function (r) {
+      return '<circle cx="' + X(Math.log10(r.tvl_usd)).toFixed(1) + '" cy="' + Y(Math.log10(r.mcap_usd)).toFixed(1) + '" r="3" fill="#3ddc84" fill-opacity="0.75"/>';
+    }).join('');
+    var lx0 = X(x0), lx1 = X(x1);
+    var ly0 = Y(lineY(x0 * LN10)), ly1 = Y(lineY(x1 * LN10));
+    var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Scatter of live-token protocols, log market cap against log TVL, with the fitted size curve">' +
+      '<line x1="' + PL + '" y1="' + (H - PB) + '" x2="' + (W - PR) + '" y2="' + (H - PB) + '" stroke="#243129"/>' +
+      '<line x1="' + PL + '" y1="' + PT + '" x2="' + PL + '" y2="' + (H - PB) + '" stroke="#243129"/>' +
+      '<line x1="' + lx0.toFixed(1) + '" y1="' + ly0.toFixed(1) + '" x2="' + lx1.toFixed(1) + '" y2="' + ly1.toFixed(1) + '" stroke="#f0b429" stroke-width="2"/>' +
+      dots +
+      '<text x="' + (W - PR) + '" y="' + (H - 8) + '" fill="#93a79b" font-size="11" text-anchor="end">log TVL</text>' +
+      '<text transform="translate(12,140) rotate(-90)" text-anchor="middle" fill="#93a79b" font-size="11">log mcap</text>' +
+      '</svg>';
+    return el('div', { class: 'chart' },
+      el('div', { class: 'chart-title', text: 'The size curve: the 24 largest live-token protocols, log market cap vs log TVL' }),
+      el('div', { html: svg }),
+      el('p', { class: 'sub', text: 'Each dot is a protocol whose token already trades. The amber line is the fitted curve log(mcap) = ' + FIT.intercept.toFixed(2) + ' + ' + FIT.slope.toFixed(2) + ' x log(TVL), fitted over all ' + FIT.liveCount + ' live-token protocols in the snapshot; the chart shows the 24 largest. A flat multiple would be a line of slope 1; the fitted slope is ' + FIT.slope.toFixed(2) + ', so big protocols pay far less per dollar of TVL than small ones.' })
+    );
+  }
+
+  function fitTables() {
+    var qrows = FIT.quartiles.map(function (q, i) {
       return el('tr', null,
-        el('td', { text: cat }),
-        el('td', { class: 'num', text: String(n) }),
-        el('td', { class: 'num', text: 'x' + (med === undefined ? 'n/a' : med.toFixed(3)) }),
-        el('td', { class: 'num', text: 'x' + mult.toFixed(3) })
+        el('td', { text: 'Quartile ' + (i + 1) }),
+        el('td', { class: 'num', text: fmtUsd(q.minTvl) + ' - ' + fmtUsd(q.maxTvl) }),
+        el('td', { class: 'num', text: String(q.n) }),
+        el('td', { class: 'num', text: 'x' + q.medianRatio.toFixed(3) })
       );
     });
-    rows.push(el('tr', null,
-      el('td', { text: 'All other categories (fallback)' }),
-      el('td', { class: 'num', text: String(CALIBRATION.liveCount) }),
-      el('td', { class: 'num', text: 'x' + CALIBRATION.fallback.toFixed(3) }),
-      el('td', { class: 'num', text: 'x' + CALIBRATION.fallback.toFixed(3) })
-    ));
-    return el('div', { class: 'table-wrap' },
-      el('table', { class: 'calib' },
-        el('caption', { class: 'sub', text: 'The multiple is calibrated, not guessed: each category\u2019s median market-cap-to-TVL ratio among the snapshot\u2019s own live-token protocols (at least 4 of them), clamped to 0.05..0.60. ' + CALIBRATION.liveCount + ' live protocols set the calibration.' }),
-        el('thead', null, el('tr', null,
-          el('th', { scope: 'col', text: 'Category' }),
-          el('th', { scope: 'col', text: 'Live protocols' }),
-          el('th', { scope: 'col', text: 'Median mcap / TVL' }),
-          el('th', { scope: 'col', text: 'Multiple used' })
-        )),
-        el('tbody', null, rows)
+    var wrows = FIT.walkForward.map(function (w) {
+      return el('tr', null,
+        el('td', { text: w.label }),
+        el('td', { class: 'num', text: w.train + ' / ' + w.test }),
+        el('td', { class: 'num', text: w.logRmseFit.toFixed(2) }),
+        el('td', { class: 'num', text: w.logRmseFlat.toFixed(2) })
+      );
+    });
+    return el('div', null,
+      el('div', { class: 'table-wrap' },
+        el('table', { class: 'calib' },
+          el('caption', { class: 'sub', text: 'Why a flat multiple misprices by size: the median market-cap-to-TVL ratio across the snapshot\u2019s own live-token protocols, by TVL quartile. The smallest quartile pays 0.88 per dollar of TVL, the largest 0.05 \u2014 a 17x spread one number cannot carry.' }),
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'TVL quartile' }),
+            el('th', { scope: 'col', text: 'TVL range' }),
+            el('th', { scope: 'col', text: 'Live protocols' }),
+            el('th', { scope: 'col', text: 'Median mcap / TVL' })
+          )),
+          el('tbody', null, qrows)
+        )
+      ),
+      el('div', { class: 'table-wrap' },
+        el('table', { class: 'calib' },
+          el('caption', { class: 'sub', text: 'Walk-forward check: the curve is fitted on the earlier listings and tested on the later ones, against the flat global median. Log error is the root-mean-square error of log predictions, so one outlier protocol cannot decide it. Lower is better.' }),
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Split' }),
+            el('th', { scope: 'col', text: 'Train / test' }),
+            el('th', { scope: 'col', text: 'Size curve log error' }),
+            el('th', { scope: 'col', text: 'Flat median log error' })
+          )),
+          el('tbody', null, wrows)
+        )
       )
     );
   }
@@ -481,12 +573,13 @@
     var m = BASE_MODEL;
     var panel = el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The multiple is what the market already pays per dollar of TVL for that kind of protocol, taken from the live-token protocols in this same snapshot. TVL is the protocol\u2019s size today, seven-day growth is its momentum, age with no token is how long a launch has stayed possible, and chain breadth is how many chains it reaches.' }),
+      el('p', { text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The multiple is fitted, not guessed: market cap grows with roughly the square root of TVL across the ' + FIT.liveCount + ' live-token protocols in this same snapshot (R\u00B2 ' + FIT.r2.toFixed(2) + '), so each protocol reads its multiple off that curve at its own size. TVL is the protocol\u2019s size today, seven-day growth is its momentum, age with no token is how long a launch has stayed possible, and chain breadth is how many chains it reaches.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x (growth >= 0 ? ' + m.growth_up_weight + ' : ' + m.growth_down_weight + ')) x maturity(age_days) x (1 + ' + m.chain_bonus + ' x min(effective_chains, ' + m.chain_cap + ')) )'
+        'implied = round( tvl_usd x clamp(exp(' + FIT.intercept.toFixed(2) + ') x tvl_usd^(' + FIT.slope.toFixed(2) + ' - 1), ' + FIT.multipleFloor + ', ' + FIT.multipleCap + ') x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x (growth >= 0 ? ' + m.growth_up_weight + ' : ' + m.growth_down_weight + ')) x maturity(age_days) x (1 + ' + m.chain_bonus + ' x min(effective_chains, ' + m.chain_cap + ')) )'
       ),
       el('p', { text: 'A fall in TVL counts half again as much as a rise of the same size, because capital leaving is a stronger signal than capital arriving. Maturity rises from ' + m.maturity_floor + ' to 1 over ' + m.maturity_days + ' days, then decays gently to ' + m.maturity_decay_floor + ' by five years: a protocol that has run four years without a token has shown it can live without one. A major chain (the eight with the most TVL in the snapshot) counts 1, any other chain counts 0.5. Age is the time since the protocol was first listed; an unlisted age uses ' + m.unknown_age_days + ' days, and a missing seven-day change counts as 0. The early radar is every pre-token protocol the snapshot holds that is not a wrapped, staked or bridged product, and the live-token protocols are set aside with their market caps shown.' }),
-      calibrationTable()
+      fitChart(),
+      fitTables()
     );
     panel.appendChild(sandbox(m));
     return panel;
@@ -516,11 +609,21 @@
     });
     var note = el('div', { class: 'sandbox-note' },
       el('p', { class: 'sub', text: 'Try the model: move a slider and the board re-ranks at once. The sandbox changes this page only; board.json and the submitted ranking keep the model above.' }),
-      el('button', { class: 'button', type: 'button', text: 'Reset model', onclick: function () { state.model = null; render(); } })
+      el('button', { class: 'button', type: 'button', text: 'Reset model', onclick: function () { state.model = null; state.fit = null; render(); } })
     );
+    var slopeOut = el('output', { text: (state.fit ? state.fit.slope : FIT.slope).toFixed(2) });
+    var slopeInput = el('input', { type: 'range', min: '0.3', max: '0.7', step: '0.01', value: String(state.fit ? state.fit.slope : FIT.slope), 'aria-label': 'Size exponent' });
+    slopeInput.addEventListener('input', function () {
+      if (!state.fit) state.fit = Object.assign({}, FIT);
+      state.fit.slope = parseFloat(slopeInput.value);
+      slopeOut.textContent = state.fit.slope.toFixed(2);
+      render();
+    });
+    var fitBox = el('div', { class: 'slider' }, el('label', { text: 'Size exponent (slope)' }), slopeInput, slopeOut);
     var box = el('div', null);
     box.appendChild(el('h3', { text: 'Model sandbox' }));
     box.appendChild(wrap);
+    box.appendChild(fitBox);
     box.appendChild(note);
     return box;
   }
@@ -560,7 +663,7 @@
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Chains' }), el('b', { class: 'num', text: String((row.chains || []).length) })),
-        el('div', null, el('span', { text: 'Category multiple (' + (row.category || 'Other') + ')' }), el('b', { class: 'num', text: 'x' + mults.multiple.toFixed(3) })),
+        el('div', null, el('span', { text: 'Size-curve multiple (TVL ' + fmtUsd(row.tvl_usd) + ')' }), el('b', { class: 'num', text: 'x' + mults.multiple.toFixed(3) })),
         meter('Growth multiplier', mults.growth, 1.9),
         meter('Maturity multiplier', mults.maturity, 1),
         meter('Chain multiplier', mults.chain, 1.16),

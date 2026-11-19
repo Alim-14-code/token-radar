@@ -186,3 +186,7 @@ tbody tr[data-selected="true"] { background: rgba(61, 220, 132, 0.08); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
+.chart { margin-top: var(--step-4); }
+.chart-title { font-weight: 650; margin-bottom: var(--step-2); }
+.chart svg { width: 100%; height: auto; display: block; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-panel); }
+.chart .sub { margin-top: var(--step-2); }
