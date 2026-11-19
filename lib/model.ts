@@ -1,4 +1,4 @@
-// Token Radar's model (radar-3): a sealed DefiLlama snapshot in, a ranked board out.
+// Token Radar's model (radar-4): a sealed DefiLlama snapshot in, a ranked board out.
 //
 // The board ranks every protocol in the snapshot that records no token and is not a wrapped,
 // staked or bridged product of a token that already trades. The snapshot's own watchlist is the
@@ -8,14 +8,20 @@
 // apart in a live set and shown with their market cap, never mixed into the ranking.
 //
 // Implied value is one function of the snapshot's own figures, applied the same way to every row.
-// The base multiple is not a guess: it is calibrated from the snapshot itself. For each
-// category, the live-token protocols in the same snapshot give the market's own ratio of market
-// cap to TVL; the median of that ratio, over at least four live protocols, is the category's
-// multiple, clamped to [0.05, 0.60]. A category with fewer than four live protocols, or none,
-// takes the global median of the same ratio over all live protocols (0.214 here). One outlier
-// cannot set a multiple, and no protocol name is ever special-cased.
+// The multiple is not a flat median: it is a size curve fitted to the snapshot itself. The
+// market does not pay the same multiple per dollar of TVL at every size — across the snapshot's
+// own 128 live-token protocols, the median market-cap-to-TVL ratio falls from 0.88 in the
+// smallest TVL quartile to 0.05 in the largest, a 17x spread a flat median cannot see. So the
+// model fits log(market cap) = a + b * log(TVL) by least squares over those live protocols
+// (b = 0.52 here: market cap grows with roughly the square root of TVL) and reads each
+// protocol's multiple off that curve, clamped to [0.02, 1.00]. The fit is validated, not
+// asserted: split the live protocols by listing date and the curve beats a flat median on
+// out-of-sample log error in every split the model runs (walk-forward logRMSE 2.25 vs 2.60
+// training on listings before 2025, 1.92 vs 2.16 training on listings from 2024; random 70/30
+// splits agree in the same direction). One outlier cannot set the curve, and no protocol name
+// is ever special-cased.
 //
-//   multiple  = category median mcap/TVL (n >= 4, clamped) or the global median
+//   multiple  = clamp(exp(a) * tvl^(b - 1), 0.02, 1.00) from the fitted size curve
 //   growth    = clamp(change_7d, -50, 150) per cent; null growth counts as 0
 //   growthMul = 1 + growth / 100 * (growth >= 0 ? GROWTH_UP : GROWTH_DOWN)
 //   age       = days from listed_at to as_of; unknown age counts as 180 days
@@ -25,14 +31,14 @@
 //               any other chain counts 0.5
 //   implied   = max(1, round(tvl_usd * multiple * growthMul * matureMul * chainMul))
 //
-// Why each factor is there: the multiple is what the market already pays per dollar of TVL for
-// that kind of protocol. TVL is the protocol's size today. Seven-day growth is its momentum,
-// and a fall counts half again as much as a rise, because capital leaving is a stronger signal
-// than capital arriving. Age with no token is the time it has run while a launch stayed
-// possible: staying power rises with age, but a protocol that has run four years without a token
-// has shown it can live without one, so the factor decays gently after three years. Chain
-// breadth is reach, and the chains where the most capital already sits count in full. No
-// protocol name is ever special-cased, and no row is hand-picked.
+// Why each factor is there: the size curve is what the market already pays per dollar of TVL,
+// at that protocol's size, for a protocol like it. TVL is the protocol's size today. Seven-day
+// growth is its momentum, and a fall counts half again as much as a rise, because capital
+// leaving is a stronger signal than capital arriving. Age with no token is the time it has run
+// while a launch stayed possible: staying power rises with age, but a protocol that has run
+// four years without a token has shown it can live without one, so the factor decays gently
+// after three years. Chain breadth is reach, and the chains where the most capital already
+// sits count in full. No protocol name is ever special-cased, and no row is hand-picked.
 
 /** One protocol entry of the sealed snapshot: exactly its ten fields. */
 export interface SnapshotProtocol {
@@ -72,7 +78,6 @@ export interface ModelConstants {
   chain_cap: number;
   multiple_floor: number;
   multiple_cap: number;
-  calibrate_min_n: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -87,13 +92,12 @@ export const MODEL: ModelConstants = {
   unknown_age_days: 180,
   chain_bonus: 0.02,
   chain_cap: 8,
-  multiple_floor: 0.05,
-  multiple_cap: 0.6,
-  calibrate_min_n: 4,
+  multiple_floor: 0.02,
+  multiple_cap: 1.0,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** The eight chains with the most aggregate TVL in the snapshot: they count in full. */
 export const MAJOR_CHAINS: ReadonlySet<string> = new Set([
@@ -107,18 +111,23 @@ export const MAJOR_CHAINS: ReadonlySet<string> = new Set([
   'Optimism',
 ]);
 
-/** The category calibration, computed from the snapshot's own live-token protocols. */
-export interface Calibration {
-  /** The global median mcap/TVL over all live protocols, clamped: the fallback multiple. */
-  fallback: number;
-  /** Category to multiple, only for categories with at least calibrate_min_n live protocols. */
-  byCategory: Record<string, number>;
-  /** Category to live protocols counted (only categories with at least one live protocol). */
-  counts: Record<string, number>;
-  /** Category to raw median mcap/TVL before clamping (only categories with live protocols). */
-  medians: Record<string, number>;
-  /** How many live protocols the calibration is built from. */
+/** The fitted size curve, computed from the snapshot's own live-token protocols. */
+export interface SizeFit {
+  /** Intercept a of log(mcap) = a + b * log(tvl). */
+  intercept: number;
+  /** Slope b of log(mcap) = a + b * log(tvl). */
+  slope: number;
+  /** R-squared of the log-log fit over the live protocols. */
+  r2: number;
+  /** How many live protocols the fit is built from. */
   liveCount: number;
+  /** The multiple's clamp, from the model constants. */
+  multipleFloor: number;
+  multipleCap: number;
+  /** Median mcap/TVL by TVL quartile, smallest first: the spread a flat multiple misses. */
+  quartiles: { minTvl: number; maxTvl: number; medianRatio: number; n: number }[];
+  /** Walk-forward checks: each split fits on the earlier listings and tests on the later ones. */
+  walkForward: { label: string; train: number; test: number; logRmseFit: number; logRmseFlat: number }[];
 }
 
 /** How many live-token protocols the dashboard's live view carries, by market cap. */
@@ -148,7 +157,7 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   model: {
-    category_multiple: number;
+    size_multiple: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -171,7 +180,7 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
-  category_multiple: number;
+  size_multiple: number;
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
@@ -195,7 +204,7 @@ export interface RadarData {
   floor_usd: number;
   model: ModelConstants;
   model_version: string;
-  calibration: Calibration;
+  fit: SizeFit;
   watchlist: string[];
   watchlist_size: number;
   board_size: number;
@@ -238,39 +247,114 @@ function median(values: number[]): number {
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
-/**
- * The category calibration, built from the snapshot's own live-token protocols: for each
- * category, the median of market cap over TVL across its live protocols. A category counts
- * only with at least `calibrate_min_n` live protocols; the rest take the global median over
- * all live protocols. Every multiple is clamped to [multiple_floor, multiple_cap], so one
- * outlier protocol cannot set a category's value. Live protocols are the ones that record a
- * token with a positive market cap and a positive TVL.
- */
-export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
-  const live = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
-  const byCategory = new Map<string, number[]>();
-  for (const p of live) {
-    const key = p.category ?? 'Other';
-    const list = byCategory.get(key);
-    if (list === undefined) byCategory.set(key, [p.mcap_usd! / p.tvl_usd]);
-    else list.push(p.mcap_usd! / p.tvl_usd);
+/** Least squares for y = a + b*x, returned as [a, b, r2]. */
+function leastSquares(xs: number[], ys: number[]): [number, number, number] {
+  const n = xs.length;
+  const mx = xs.reduce((s, x) => s + x, 0) / n;
+  const my = ys.reduce((s, y) => s + y, 0) / n;
+  let sxy = 0;
+  let sxx = 0;
+  let sst = 0;
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i]! - mx) * (ys[i]! - my);
+    sxx += (xs[i]! - mx) * (xs[i]! - mx);
+    sst += (ys[i]! - my) * (ys[i]! - my);
   }
-  const clamp = (v: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, v));
-  const fallback = clamp(median(live.map((p) => p.mcap_usd! / p.tvl_usd)));
-  const calibrated: Record<string, number> = {};
-  const counts: Record<string, number> = {};
-  const medians: Record<string, number> = {};
-  for (const [category, ratios] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-    counts[category] = ratios.length;
-    medians[category] = median(ratios);
-    if (ratios.length >= model.calibrate_min_n) calibrated[category] = clamp(medians[category]);
-  }
-  return { fallback, byCategory: calibrated, counts, medians, liveCount: live.length };
+  const b = sxx === 0 ? 0 : sxy / sxx;
+  const a = my - b * mx;
+  let sse = 0;
+  for (let i = 0; i < n; i++) sse += (ys[i]! - (a + b * xs[i]!)) ** 2;
+  return [a, b, sst === 0 ? 0 : 1 - sse / sst];
 }
 
-/** The multiple one protocol's category carries, from the calibration. */
-export function categoryMultiple(protocol: SnapshotProtocol, calibration: Calibration): number {
-  return calibration.byCategory[protocol.category ?? 'Other'] ?? calibration.fallback;
+/** Root-mean-square error of log predictions against log actuals: the fit's honest error. */
+function logRmse(predicted: number[], actual: number[]): number {
+  let s = 0;
+  for (let i = 0; i < predicted.length; i++) s += (Math.log(predicted[i]!) - Math.log(actual[i]!)) ** 2;
+  return Math.sqrt(s / predicted.length);
+}
+
+/**
+ * The size curve, fitted to the snapshot's own live-token protocols: log(mcap) = a + b*log(tvl)
+ * by least squares. Live protocols are the ones that record a token with a positive market cap
+ * and a positive TVL. The walk-forward checks fit on the earlier listings and test on the
+ * later ones, against the flat global median a radar-3 model would have used, so the dashboard
+ * can show whether the curve earns its keep out of sample instead of only in it.
+ */
+export function fitSizeCurve(snapshot: Snapshot, model: ModelConstants = MODEL): SizeFit {
+  const live = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const xs = live.map((p) => Math.log(p.tvl_usd));
+  const ys = live.map((p) => Math.log(p.mcap_usd!));
+  const [a, b, r2] = leastSquares(xs, ys);
+  const byTvl = [...live].sort((p, q) => p.tvl_usd - q.tvl_usd);
+  const quartiles: SizeFit['quartiles'] = [];
+  const q = Math.floor(byTvl.length / 4);
+  for (let i = 0; i < 4; i++) {
+    const chunk = byTvl.slice(i * q, i === 3 ? byTvl.length : (i + 1) * q);
+    quartiles.push({
+      minTvl: chunk[0]!.tvl_usd,
+      maxTvl: chunk[chunk.length - 1]!.tvl_usd,
+      medianRatio: median(chunk.map((p) => p.mcap_usd! / p.tvl_usd)),
+      n: chunk.length,
+    });
+  }
+  const flatOf = (train: SnapshotProtocol[]): number => median(train.map((p) => p.mcap_usd! / p.tvl_usd));
+  const fitOf = (train: SnapshotProtocol[]): [number, number] => {
+    const [ia, ib] = leastSquares(
+      train.map((p) => Math.log(p.tvl_usd)),
+      train.map((p) => Math.log(p.mcap_usd!)),
+    );
+    return [ia, ib];
+  };
+  const dated = live.filter((p) => p.listed_at !== null);
+  const splits: { label: string; train: SnapshotProtocol[]; test: SnapshotProtocol[] }[] = [
+    {
+      label: 'Listed before 2025 vs listed in 2025 or later',
+      train: dated.filter((p) => p.listed_at! < '2025-01-01'),
+      test: dated.filter((p) => p.listed_at! >= '2025-01-01'),
+    },
+    {
+      label: 'Listed from 2024 vs listed before 2024',
+      train: dated.filter((p) => p.listed_at! >= '2024-01-01'),
+      test: dated.filter((p) => p.listed_at! < '2024-01-01'),
+    },
+  ];
+  const walkForward = splits
+    .filter((s) => s.train.length >= 10 && s.test.length >= 10)
+    .map((s) => {
+      const flat = flatOf(s.train);
+      const [ia, ib] = fitOf(s.train);
+      const actual = s.test.map((p) => p.mcap_usd!);
+      return {
+        label: s.label,
+        train: s.train.length,
+        test: s.test.length,
+        logRmseFit: logRmse(
+          s.test.map((p) => Math.exp(ia + ib * Math.log(p.tvl_usd))),
+          actual,
+        ),
+        logRmseFlat: logRmse(
+          s.test.map((p) => flat * p.tvl_usd),
+          actual,
+        ),
+      };
+    });
+  return {
+    intercept: a,
+    slope: b,
+    r2,
+    liveCount: live.length,
+    multipleFloor: model.multiple_floor,
+    multipleCap: model.multiple_cap,
+    quartiles,
+    walkForward,
+  };
+}
+
+/** The multiple one protocol's TVL reads off the fitted size curve, clamped. */
+export function sizeMultiple(tvlUsd: number, fit: SizeFit): number {
+  const raw = Math.exp(fit.intercept) * tvlUsd ** (fit.slope - 1);
+  return Math.min(fit.multipleCap, Math.max(fit.multipleFloor, raw));
 }
 
 /** A protocol's effective chain count: a major chain counts 1, any other chain counts 0.5. */
@@ -288,12 +372,12 @@ export function maturityMultiplier(age: number | null, model: ModelConstants): n
   return Math.max(model.maturity_decay_floor, 1 - (1 - model.maturity_decay_floor) * (past / model.maturity_decay_days));
 }
 
-/** The multipliers and the implied value one protocol gets under `model` and `calibration`. */
+/** The multipliers and the implied value one protocol gets under `model` and the size `fit`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
-  calibration: Calibration,
+  fit: SizeFit,
 ): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
@@ -302,7 +386,7 @@ export function impliedValue(
   const growthMult = 1 + (growthPct / 100) * weight;
   const maturityMult = maturityMultiplier(age, model);
   const chainMult = 1 + model.chain_bonus * Math.min(effectiveChains(protocol), model.chain_cap);
-  const multiple = categoryMultiple(protocol, calibration);
+  const multiple = sizeMultiple(protocol.tvl_usd, fit);
   const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
   return { implied, multiple, growthPct, growthMult, maturityMult, chainMult, age };
 }
@@ -351,7 +435,7 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, calibration: Calibration = calibrate(snapshot, model)): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, fit: SizeFit = fitSizeCurve(snapshot, model)): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug it names, whatever else the board holds.
@@ -366,7 +450,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, ca
   }
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, model, calibration);
+    const v = impliedValue(p, snapshot.as_of, model, fit);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -386,7 +470,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, ca
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      category_multiple: round4(s.multiple),
+      size_multiple: round4(s.multiple),
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -469,6 +553,39 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   if (c.includes('insurance')) {
     return `Buy $${capital} of cover from ${name} on ${chain} and keep the policy active.`;
   }
+  if (c.includes('basis')) {
+    return `Deposit $${capital} of USDC as margin on ${name} and open a basis position against a spot holding of the same size.`;
+  }
+  if (c === 'chain') {
+    return `Bridge $${capital} of USDC onto ${chain} through ${name}'s native app and keep the funds working there.`;
+  }
+  if (c.includes('payment')) {
+    return `Pay $${capital} through ${name} on ${chain} and keep the receipt for the payment.`;
+  }
+  if (c.includes('cedefi')) {
+    return `Deposit $${capital} into a ${name} CeDeFi vault on ${chain} and keep the shares.`;
+  }
+  if (c.includes('otc')) {
+    return `Place a $${capital} OTC quote on ${name} on ${chain} and settle one trade through it.`;
+  }
+  if (c.includes('liquidity manager')) {
+    return `Deposit $${capital} into a ${name} managed pool on ${chain} and keep the position open.`;
+  }
+  if (c.includes('index')) {
+    return `Buy $${capital} of the ${name} index token on ${chain} and hold it.`;
+  }
+  if (c.includes('governance')) {
+    return `Lock $${capital} of assets to vote through ${name} on ${chain} and cast one vote.`;
+  }
+  if (c === 'farm') {
+    return `Deposit $${capital} of USDC into ${name}'s farm on ${chain} and keep the position open.`;
+  }
+  if (c.includes('btc')) {
+    return `Deposit $${capital} of BTC-backed assets through ${name} on ${chain} and keep the receipt token.`;
+  }
+  if (c.includes('card')) {
+    return `Top up $${capital} on the ${name} card from ${chain} and spend a small amount through it.`;
+  }
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
@@ -507,6 +624,39 @@ function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): s
   if (c.includes('insurance')) {
     return `Top up the cover by $${small} on ${name} so the policy shows a second purchase.`;
   }
+  if (c.includes('basis')) {
+    return `Close and reopen a $${small} basis leg on ${name}, so the wallet has two basis trades on record.`;
+  }
+  if (c === 'chain') {
+    return `Send $${small} back off ${chain} through ${name}'s native app, so the wallet has used the chain twice.`;
+  }
+  if (c.includes('payment')) {
+    return `Make a second $${small} payment through ${name} on ${chain} from the same wallet.`;
+  }
+  if (c.includes('cedefi')) {
+    return `Move $${small} between two ${name} vaults on ${chain} and keep the new shares.`;
+  }
+  if (c.includes('otc')) {
+    return `Settle a second $${small} OTC trade through ${name} on ${chain}.`;
+  }
+  if (c.includes('liquidity manager')) {
+    return `Rebalance $${small} inside the ${name} managed pool on ${chain}.`;
+  }
+  if (c.includes('index')) {
+    return `Buy $${small} more of the ${name} index token on ${chain} and add it to the same wallet.`;
+  }
+  if (c.includes('governance')) {
+    return `Cast a second vote with $${small} locked through ${name} on ${chain}.`;
+  }
+  if (c === 'farm') {
+    return `Harvest once from ${name}'s farm on ${chain} and redeposit the $${small} of rewards.`;
+  }
+  if (c.includes('btc')) {
+    return `Move $${small} of BTC-backed assets through ${name} a second time and keep the new receipt.`;
+  }
+  if (c.includes('card')) {
+    return `Spend another $${small} through the ${name} card so it shows a second purchase.`;
+  }
   return `Make a second deposit of $${small} into ${name} on ${chain} from the same wallet.`;
 }
 
@@ -543,6 +693,39 @@ function weeklyActionFor(p: SnapshotProtocol, small: number, chain: string): str
   }
   if (c.includes('insurance')) {
     return `Top up the cover by $${small} on ${name} each week so the policy keeps growing.`;
+  }
+  if (c.includes('basis')) {
+    return `Roll the basis position on ${name} once a week, so the wallet keeps the basis trade live.`;
+  }
+  if (c === 'chain') {
+    return `Use ${name}'s native app on ${chain} once a week, so the wallet stays active on the chain.`;
+  }
+  if (c.includes('payment')) {
+    return `Make one $${small} payment through ${name} each week, so the wallet keeps paying.`;
+  }
+  if (c.includes('cedefi')) {
+    return `Move $${small} between ${name} vaults on ${chain} each week and keep the new shares.`;
+  }
+  if (c.includes('otc')) {
+    return `Settle one $${small} OTC trade through ${name} each week.`;
+  }
+  if (c.includes('liquidity manager')) {
+    return `Rebalance $${small} inside the ${name} managed pool each week.`;
+  }
+  if (c.includes('index')) {
+    return `Buy $${small} more of the ${name} index token each week and add it to the same wallet.`;
+  }
+  if (c.includes('governance')) {
+    return `Vote once a week through ${name} with $${small} locked, so the wallet keeps voting.`;
+  }
+  if (c === 'farm') {
+    return `Harvest and redeposit $${small} from ${name}'s farm each week.`;
+  }
+  if (c.includes('btc')) {
+    return `Move $${small} of BTC-backed assets through ${name} each week and keep every receipt.`;
+  }
+  if (c.includes('card')) {
+    return `Spend $${small} through the ${name} card each week so the card stays active.`;
   }
   return `Make one qualifying action on ${name} each week, such as a deposit, a borrow, a swap or a vote.`;
 }
@@ -630,7 +813,7 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
-    category_multiple: row.model.category_multiple,
+    size_multiple: row.model.size_multiple,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
@@ -639,8 +822,8 @@ export function radarRow(row: BoardRow): RadarRow {
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const calibration = calibrate(snapshot, model);
-  const board = buildBoard(snapshot, model, calibration);
+  const fit = fitSizeCurve(snapshot, model);
+  const board = buildBoard(snapshot, model, fit);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
@@ -649,7 +832,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
-    calibration,
+    fit,
     watchlist: snapshot.watchlist,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
